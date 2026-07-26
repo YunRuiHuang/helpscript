@@ -4,158 +4,133 @@ set -euo pipefail
 CONFIG_DIR="$HOME/.config/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 UI_DIR="$CONFIG_DIR/ui"
-URL_FILE="$CONFIG_DIR/subscription_url.txt"
+PROVIDER_DIR="$CONFIG_DIR/providers"
 CONTROLLER_PORT="9091"
+MIXED_PORT="7890"
 
 usage() {
     cat <<EOF
 用法：
+  $0 "订阅链接"
 
-  第一次保存订阅并更新：
-    $0 "https://你的订阅链接"
+示例：
+  $0 "https://example.com/app/status/new/xxxxxxxx"
 
-  以后直接更新：
-    $0
-
-订阅地址保存在：
-  $URL_FILE
+说明：
+  脚本不会自行下载订阅。
+  它会把链接写入 Mihomo 的 proxy-providers，
+  之后由 Mihomo 自己获取和定时更新节点。
 EOF
 }
 
-# 第一次运行时接收 URL；以后不传参数则读取已保存地址
-if [[ $# -gt 1 ]]; then
+if [[ $# -ne 1 ]]; then
     usage
     exit 1
 fi
 
-mkdir -p "$CONFIG_DIR"
+SUBSCRIPTION_URL="$1"
 
-if [[ $# -eq 1 ]]; then
-    SUBSCRIPTION_URL="$1"
-    printf '%s\n' "$SUBSCRIPTION_URL" > "$URL_FILE"
-    chmod 600 "$URL_FILE"
-elif [[ -f "$URL_FILE" ]]; then
-    SUBSCRIPTION_URL="$(cat "$URL_FILE")"
-else
-    echo "错误：尚未保存订阅链接。"
-    usage
+if [[ ! "$SUBSCRIPTION_URL" =~ ^https?:// ]]; then
+    echo "错误：订阅地址必须以 http:// 或 https:// 开头。"
     exit 1
 fi
 
-if [[ -z "$SUBSCRIPTION_URL" ]]; then
-    echo "错误：订阅链接为空。"
-    exit 1
+mkdir -p "$CONFIG_DIR" "$PROVIDER_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    BACKUP="$CONFIG_FILE.bak.$(date '+%Y%m%d_%H%M%S')"
+    cp "$CONFIG_FILE" "$BACKUP"
+    echo "旧配置已备份到："
+    echo "  $BACKUP"
 fi
 
-TMP_DOWNLOADED="$(mktemp)"
-TMP_CONFIG="$(mktemp)"
-TMP_TEST_DIR="$(mktemp -d)"
-
-cleanup() {
-    rm -f "$TMP_DOWNLOADED" "$TMP_CONFIG"
-    rm -rf "$TMP_TEST_DIR"
-}
-trap cleanup EXIT
-
-echo "==> 正在下载订阅配置……"
-
-curl \
-    --fail \
-    --location \
-    --silent \
-    --show-error \
-    --connect-timeout 15 \
-    --max-time 60 \
-    -A "clash-verge/v1.7.7" \
-    "$SUBSCRIPTION_URL" \
-    -o "$TMP_DOWNLOADED"
-
-if [[ ! -s "$TMP_DOWNLOADED" ]]; then
-    echo "错误：下载结果为空。"
-    exit 1
-fi
-
-# 防止把登录网页、JS 防护页面等误当成配置
-if grep -Eiq '^[[:space:]]*<(html|!doctype|script)' "$TMP_DOWNLOADED"; then
-    echo "错误：服务器返回的是网页或 JavaScript，不是 Clash/Mihomo YAML 配置。"
-    exit 1
-fi
-
-# 至少应包含代理、代理组或代理提供者之一
-if ! grep -Eq '^(proxies|proxy-groups|proxy-providers):' "$TMP_DOWNLOADED"; then
-    echo "错误：下载内容看起来不像完整的 Clash/Mihomo 配置。"
-    echo
-    echo "文件开头如下："
-    head -n 10 "$TMP_DOWNLOADED"
-    exit 1
-fi
-
-echo "==> 正在加入本机 WebUI 和局域网代理设置……"
-
-# 删除订阅文件中可能已有的同名顶层设置，避免 YAML 重复键
-awk '
-BEGIN {
-    skip_block = 0
-}
-{
-    # 当进入下一个顶层字段时，停止跳过
-    if ($0 ~ /^[^[:space:]#][^:]*:/) {
-        skip_block = 0
-    }
-
-    # 删除这些顶层字段；目前都是单行字段
-    if ($0 ~ /^(mixed-port|allow-lan|bind-address|external-controller|external-ui|secret):/) {
-        next
-    }
-
-    print
-}
-' "$TMP_DOWNLOADED" > "$TMP_CONFIG"
-
-cat >> "$TMP_CONFIG" <<EOF
-
-# 以下设置由 update_subscription.sh 添加
-mixed-port: 7890
+cat > "$CONFIG_FILE" <<EOF
+mixed-port: ${MIXED_PORT}
 allow-lan: true
 bind-address: "*"
+
+mode: rule
+log-level: info
+ipv6: false
 
 external-controller: 0.0.0.0:${CONTROLLER_PORT}
 external-ui: ${UI_DIR}
 secret: ""
+
+proxy-providers:
+  xgcloud:
+    type: http
+    url: "${SUBSCRIPTION_URL}"
+    path: ./providers/xgcloud.yaml
+    interval: 86400
+
+    header:
+      User-Agent:
+        - "Clash-Verge"
+
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      lazy: true
+
+proxy-groups:
+  - name: "节点选择"
+    type: select
+    proxies:
+      - "自动选择"
+      - DIRECT
+    use:
+      - xgcloud
+
+  - name: "自动选择"
+    type: url-test
+    use:
+      - xgcloud
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 100
+    lazy: true
+
+rules:
+  - MATCH,节点选择
 EOF
 
-echo "==> 正在测试新配置……"
+chmod 600 "$CONFIG_FILE"
 
-# 使用独立目录测试，避免污染当前运行配置
-cp "$TMP_CONFIG" "$TMP_TEST_DIR/config.yaml"
+echo
+echo "正在检查配置……"
 
-if ! /usr/local/bin/mihomo -t -d "$TMP_TEST_DIR"; then
+if ! /usr/local/bin/mihomo -t -d "$CONFIG_DIR"; then
     echo
-    echo "错误：新配置未通过 Mihomo 检查。"
-    echo "当前正在使用的 config.yaml 没有被修改。"
+    echo "错误：配置检查失败。"
+
+    if [[ -n "${BACKUP:-}" && -f "$BACKUP" ]]; then
+        cp "$BACKUP" "$CONFIG_FILE"
+        echo "已经恢复旧配置。"
+    fi
+
     exit 1
 fi
 
-echo "==> 配置测试通过。"
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    BACKUP_FILE="$CONFIG_FILE.bak.$(date '+%Y%m%d_%H%M%S')"
-    cp "$CONFIG_FILE" "$BACKUP_FILE"
-    echo "==> 旧配置已备份到："
-    echo "    $BACKUP_FILE"
-fi
-
-install -m 600 "$TMP_CONFIG" "$CONFIG_FILE"
-
-echo "==> 正在重启 Mihomo……"
+echo "配置检查通过。"
+echo "正在重启 Mihomo……"
 
 sudo systemctl restart mihomo
 
-sleep 1
+sleep 2
 
 if ! systemctl is-active --quiet mihomo; then
-    echo "错误：Mihomo 重启后未正常运行。"
     echo
+    echo "错误：Mihomo 没有正常启动。"
+
+    if [[ -n "${BACKUP:-}" && -f "$BACKUP" ]]; then
+        cp "$BACKUP" "$CONFIG_FILE"
+        sudo systemctl restart mihomo
+        echo "已经恢复旧配置并重新启动。"
+    fi
+
     journalctl -u mihomo -n 30 --no-pager
     exit 1
 fi
@@ -164,15 +139,16 @@ SERVER_IP="$(hostname -I | awk '{print $1}')"
 
 echo
 echo "========================================"
-echo " 订阅更新成功"
+echo " 订阅配置完成"
 echo "========================================"
+echo
+echo "Mihomo 将自行获取订阅节点。"
 echo
 echo "MetaCubeXD："
 echo "  http://${SERVER_IP}:${CONTROLLER_PORT}/ui"
 echo
-echo "局域网代理："
-echo "  地址：${SERVER_IP}"
-echo "  HTTP / SOCKS Mixed 端口：7890"
+echo "局域网 Mixed 代理："
+echo "  ${SERVER_IP}:${MIXED_PORT}"
 echo
-echo "以后更新只需运行："
-echo "  $0"
+echo "查看订阅获取日志："
+echo "  journalctl -u mihomo -f"
