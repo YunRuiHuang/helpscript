@@ -1,57 +1,88 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "====================================="
-echo "      Mihomo Installer"
-echo "====================================="
+########################################
+# install_mihomo.sh
+#
+# Usage:
+# ./install_mihomo.sh \
+#   --mihomo ~/Downloads/mihomo-linux-amd64-v1.19.29.gz \
+#   --ui ~/Downloads/compressed-dist.tgz
+########################################
 
-ARCH=$(uname -m)
+MIHOMO=""
+UI=""
 
-case "$ARCH" in
-    x86_64)
-        FILE="mihomo-linux-amd64-alpha.gz"
-        ;;
-    aarch64|arm64)
-        FILE="mihomo-linux-arm64-alpha.gz"
-        ;;
-    *)
-        echo "Unsupported architecture: $ARCH"
-        exit 1
-        ;;
-esac
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mihomo)
+            MIHOMO="$2"
+            shift 2
+            ;;
+        --ui)
+            UI="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage:"
+            echo "  $0 --mihomo <mihomo.gz> --ui <compressed-dist.tgz>"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$MIHOMO" || -z "$UI" ]]; then
+    echo "Usage:"
+    echo "  $0 --mihomo <mihomo.gz> --ui <compressed-dist.tgz>"
+    exit 1
+fi
+
+if [[ ! -f "$MIHOMO" ]]; then
+    echo "Mihomo package not found:"
+    echo "  $MIHOMO"
+    exit 1
+fi
+
+if [[ ! -f "$UI" ]]; then
+    echo "MetaCubeXD package not found:"
+    echo "  $UI"
+    exit 1
+fi
 
 CONFIG_DIR="$HOME/.config/mihomo"
 UI_DIR="$CONFIG_DIR/ui"
 
 mkdir -p "$CONFIG_DIR"
-mkdir -p "$UI_DIR"
 
 TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+echo "==> Installing Mihomo..."
+
+cp "$MIHOMO" "$TMP/"
 cd "$TMP"
 
-echo
-echo "Downloading Mihomo..."
+GZ=$(basename "$MIHOMO")
+gunzip "$GZ"
 
-wget -q "https://github.com/MetaCubeX/mihomo/releases/latest/download/$FILE"
-
-gunzip "$FILE"
-
-BIN="${FILE%.gz}"
+BIN="${GZ%.gz}"
 
 chmod +x "$BIN"
 
-sudo mv "$BIN" /usr/local/bin/mihomo
+sudo install -m 755 "$BIN" /usr/local/bin/mihomo
 
-echo
-echo "Downloading MetaCubeXD..."
+echo "==> Installing MetaCubeXD..."
 
-wget -q https://github.com/MetaCubeX/metacubexd/releases/latest/download/compressed-dist.tgz
+rm -rf "$UI_DIR"
+mkdir -p "$UI_DIR"
 
-rm -rf "$UI_DIR"/*
+tar -xzf "$UI" -C "$UI_DIR"
 
-tar -xzf compressed-dist.tgz -C "$UI_DIR"
-
-if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
+if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
 
 cat > "$CONFIG_DIR/config.yaml" <<EOF
 mixed-port: 7890
@@ -77,13 +108,13 @@ EOF
 
 fi
 
-echo
-echo "Creating systemd service..."
+echo "==> Installing systemd service..."
 
 sudo tee /etc/systemd/system/mihomo.service >/dev/null <<EOF
 [Unit]
 Description=Mihomo
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -102,20 +133,21 @@ sudo systemctl enable mihomo
 sudo systemctl restart mihomo
 
 echo
-echo "====================================="
-echo "Installed successfully!"
-echo "====================================="
+echo "========================================"
+echo " Mihomo Installed Successfully"
+echo "========================================"
+echo
+echo "Version:"
+mihomo -v || true
 echo
 echo "WebUI:"
 echo "http://$(hostname -I | awk '{print $1}'):9090/ui"
 echo
 echo "Config:"
-echo "$CONFIG_DIR/config.yaml"
+echo "  $CONFIG_DIR/config.yaml"
 echo
-echo "Useful commands:"
-echo
-echo "systemctl status mihomo"
-echo "journalctl -u mihomo -f"
-echo "systemctl restart mihomo"
-echo "systemctl stop mihomo"
-echo
+echo "Commands:"
+echo "  systemctl status mihomo"
+echo "  journalctl -u mihomo -f"
+echo "  systemctl restart mihomo"
+echo "  systemctl stop mihomo"
